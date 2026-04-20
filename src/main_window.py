@@ -33,6 +33,7 @@ import cv2
 from .camera import CameraManager, CameraStatus, ImageAcquisition, simulate_datamatrix_image
 from .quality_analyzer import DataMatrixQualityAnalyzer, DataMatrixMetrics, PrintQualityGrade, detect_datamatrix_region, decode_datamatrix
 from .database import ScanHistoryDB, get_database
+from .datamatrix_scanner import AutoDataMatrixScanner, ContinuousScanner, DataMatrixResult, DetectionStatus
 
 
 class WorkerThread(QThread):
@@ -40,10 +41,12 @@ class WorkerThread(QThread):
     frame_processed = pyqtSignal(np.ndarray, object)  # frame, metrics
     scan_completed = pyqtSignal(object)  # metrics
     error_occurred = pyqtSignal(str)
+    autoscan_result = pyqtSignal(object)  # DataMatrixResult
 
-    def __init__(self, analyzer: DataMatrixQualityAnalyzer):
+    def __init__(self, analyzer: DataMatrixQualityAnalyzer, auto_scanner: AutoDataMatrixScanner = None):
         super().__init__()
         self.analyzer = analyzer
+        self.auto_scanner = auto_scanner
         self.frame = None
         self.running = False
 
@@ -59,28 +62,65 @@ class WorkerThread(QThread):
             try:
                 frame = self.frame.copy()
 
-                # Детекция области DataMatrix
-                result = detect_datamatrix_region(frame)
-
-                if result:
-                    roi, bbox = result
-
-                    # Рисуем рамку вокруг обнаруженного кода
-                    x, y, w, h = bbox
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-
-                    # Декодирование
-                    decoded = decode_datamatrix(roi)
-
-                    # Анализ качества
-                    metrics = self.analyzer.analyze(roi, decoded)
-
-                    self.frame_processed.emit(frame, metrics)
-
-                    if metrics.decode_success:
+                # Если есть автосканер - используем его
+                if self.auto_scanner:
+                    result = self.auto_scanner.process_frame(frame)
+                    
+                    if result.status == DetectionStatus.DECODED:
+                        # Рисуем рамку
+                        if result.bbox:
+                            x, y, w, h = result.bbox
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        
+                        # Эмитим результат
+                        self.autoscan_result.emit(result)
+                        
+                        # Создаём метрики для совместимости
+                        from .quality_analyzer import DataMatrixMetrics, PrintQualityGrade
+                        metrics = DataMatrixMetrics(
+                            data_content=result.data,
+                            decode_success=True,
+                            overall_grade=PrintQualityGrade.A,
+                            grade_score=result.confidence * 100,
+                            symbol_size=(frame.shape[1], frame.shape[0])
+                        )
+                        self.frame_processed.emit(frame, metrics)
                         self.scan_completed.emit(metrics)
+                    elif result.status == DetectionStatus.FOUND:
+                        # Код найден, но не декодирован
+                        if result.bbox:
+                            x, y, w, h = result.bbox
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 165, 0), 2)
+                        self.frame_processed.emit(frame, None)
+                    else:
+                        # Используем старый метод детекции
+                        detect_result = detect_datamatrix_region(frame)
+                        if detect_result:
+                            roi, bbox = detect_result
+                            x, y, w, h = bbox
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                            decoded = decode_datamatrix(roi)
+                            metrics = self.analyzer.analyze(roi, decoded)
+                            self.frame_processed.emit(frame, metrics)
+                            if metrics.decode_success:
+                                self.scan_completed.emit(metrics)
+                        else:
+                            self.frame_processed.emit(frame, None)
                 else:
-                    self.frame_processed.emit(frame, None)
+                    # Старый метод без автосканера
+                    result = detect_datamatrix_region(frame)
+
+                    if result:
+                        roi, bbox = result
+                        x, y, w, h = bbox
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        decoded = decode_datamatrix(roi)
+                        metrics = self.analyzer.analyze(roi, decoded)
+                        self.frame_processed.emit(frame, metrics)
+                        if metrics.decode_success:
+                            self.scan_completed.emit(metrics)
+                    else:
+                        self.frame_processed.emit(frame, None)
 
             except Exception as e:
                 self.error_occurred.emit(str(e))
@@ -173,12 +213,18 @@ class MainWindow(QMainWindow):
         self.analyzer = DataMatrixQualityAnalyzer()
         self.db = get_database()
         self.image_acq = ImageAcquisition(self.camera)
-        self.worker = WorkerThread(self.analyzer)
+        
+        # Новый автоматический сканер DataMatrix
+        self.auto_scanner = AutoDataMatrixScanner()
+        self.continuous_scanner = ContinuousScanner(self.auto_scanner)
+        
+        self.worker = WorkerThread(self.analyzer, self.auto_scanner)
 
         # Состояние
         self.current_metrics: DataMatrixMetrics = None
         self.auto_capture = False
         self.captured_images = []
+        self.auto_scan_enabled = False  # Флаг автоматического сканирования
 
         # Загрузка настроек
         self.settings = QSettings("PROGRESS", "DataMatrixScanner")
@@ -341,6 +387,11 @@ class MainWindow(QMainWindow):
         self.auto_capture_cb = QCheckBox("Автозахват при обнаружении")
         self.auto_capture_cb.toggled.connect(lambda c: setattr(self, 'auto_capture', c))
         ctrl_layout.addWidget(self.auto_capture_cb, 2, 0, 1, 2)
+        
+        # Автоматическое сканирование (новый функционал)
+        self.auto_scan_cb = QCheckBox("Автосканер DataMatrix")
+        self.auto_scan_cb.toggled.connect(self.toggle_auto_scanner)
+        ctrl_layout.addWidget(self.auto_scan_cb, 3, 0, 1, 2)
 
         layout.addWidget(ctrl_group)
 
@@ -928,6 +979,88 @@ class MainWindow(QMainWindow):
     def on_error(self, error_msg: str):
         """Обработка ошибок"""
         self.status_bar.showMessage(f"Ошибка: {error_msg}", 5000)
+    
+    def toggle_auto_scanner(self, enabled: bool):
+        """
+        Включение/выключение автоматического сканера DataMatrix
+        
+        Args:
+            enabled: Флаг включения автосканера
+        """
+        self.auto_scan_enabled = enabled
+        
+        if enabled:
+            # Запуск непрерывного сканера
+            self.continuous_scanner.set_auto_capture(
+                enabled=self.auto_capture,
+                capture_callback=self.on_auto_capture
+            )
+            self.continuous_scanner.start(callback=self.on_autoscan_result)
+            self.auto_scan_cb.setText("Автосканер: ВКЛ")
+            self.status_bar.showMessage("Автоматический сканер DataMatrix запущен")
+        else:
+            # Остановка сканера
+            self.continuous_scanner.stop()
+            self.auto_scan_cb.setText("Автосканер DataMatrix")
+            self.status_bar.showMessage("Автоматический сканер остановлен")
+    
+    def on_autoscan_result(self, result: DataMatrixResult):
+        """
+        Callback при результате автоматического сканирования
+        
+        Args:
+            result: Результат сканирования
+        """
+        if result.status == DetectionStatus.DECODED:
+            # Отображение рамки на изображении
+            frame = self.camera.current_frame
+            if frame is not None and result.bbox:
+                x, y, w, h = result.bbox
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                self.display_frame(frame)
+            
+            # Обновление информации о данных
+            self.data_content_label.setText(result.data)
+            self.decode_status_label.setText(f"Декодирование: УСПЕШНО ({result.confidence:.1%})")
+            
+            # Логирование
+            self.log_message(f"DataMatrix найден: {result.data[:50]}... (уверенность: {result.confidence:.1%})")
+    
+    def on_auto_capture(self, frame: np.ndarray, result: DataMatrixResult):
+        """
+        Обработка автоматического захвата кадра
+        
+        Args:
+            frame: Захваченный кадр
+            result: Результат сканирования
+        """
+        # Сохранение в историю через создание временных метрик
+        from .quality_analyzer import DataMatrixMetrics
+        
+        metrics = DataMatrixMetrics(
+            data_content=result.data,
+            decode_success=True,
+            overall_grade=PrintQualityGrade.A,
+            grade_score=result.confidence * 100,
+            symbol_size=(frame.shape[1], frame.shape[0])
+        )
+        
+        scan_id = self.save_scan_to_history(metrics)
+        self.status_bar.showMessage(f"Автозахват! Код сохранён в историю (ID: {scan_id})")
+        
+        # Логирование
+        self.log_message(f"АВТОЗАХВАТ: {result.data[:50]}...")
+    
+    def log_message(self, message: str):
+        """Добавление сообщения в лог"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        
+        # Если есть виджет лога - добавляем туда
+        if hasattr(self, 'log_text'):
+            self.log_text.append(log_entry)
+        else:
+            print(log_entry)
 
     def restore_settings(self):
         """Восстановление настроек"""
