@@ -5,12 +5,8 @@ block_cipher = None
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[
-        # OpenCV DLLs
-    ],
-    datas=[
-        # Ресурсы приложения
-    ],
+    binaries=[],
+    datas=[],
     hiddenimports=[
         'PyQt6',
         'PyQt6.QtCore',
@@ -22,6 +18,7 @@ a = Analysis(
         'pyzbar',
         'pylibdmtx',
         'loguru',
+        'pkg_resources.py2_warn',
     ],
     hookspath=[],
     hooksconfig={},
@@ -29,7 +26,8 @@ a = Analysis(
     excludes=[
         'tkinter',
         'matplotlib',
-        'PIL',
+        'PIL.ImageDraw',
+        'PIL._tkinter_finder',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -42,37 +40,19 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='DataMatrixScanner',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,  # Без консольного окна
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch='x64',  # Только x64
+    target_arch='x64',
     codesign_identity='',
     entitlements_file=None,
-    icon='assets/icon.ico',  # Иконка приложения
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    target_arch='x64',
-    name='DataMatrixScanner',
-)
-
-# Создание установочного архива
-dist = DIST(
-    coll,
-    name='DataMatrixScanner-Setup',
-    exclude=[],
+    icon='assets/icon.ico',
 )
