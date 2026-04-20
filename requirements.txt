@@ -1,0 +1,19 @@
+# GUI
+PyQt6>=6.4.0
+
+# Computer Vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# DataMatrix decoding
+pyzbar>=0.1.9
+
+# Database
+sqlalchemy>=2.0.0
+
+# Logging
+loguru>=0.7.0
+
+# Build
+pyinstaller>=6.0.0
