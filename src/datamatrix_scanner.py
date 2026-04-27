@@ -144,9 +144,8 @@ class AutoDataMatrixScanner:
         
         Применяет:
         - Конвертацию в градации серого
-        - Усиление контраста (CLAHE)
-        - Уменьшение шума
-        - Повышение резкости
+        - Быстрое усиление контраста
+        - Минимальное уменьшение шума
         """
         # Конвертация в grayscale
         if len(frame.shape) == 3:
@@ -154,20 +153,14 @@ class AutoDataMatrixScanner:
         else:
             gray = frame.copy()
         
-        # CLAHE для усиления локального контраста
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # Быстрое усиление контраста через CLAHE с меньшими параметрами
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         
-        # Уменьшение шума (быстрый фильтр)
-        denoised = cv2.fastNlMeansDenoising(enhanced, None, h=10, templateWindowSize=7, searchWindowSize=21)
+        # Очень быстрое уменьшение шума (медианный фильтр)
+        denoised = cv2.medianBlur(enhanced, 3)
         
-        # Повышение резкости
-        kernel = np.array([[-1, -1, -1],
-                          [-1,  9, -1],
-                          [-1, -1, -1]])
-        sharpened = cv2.filter2D(denoised, -1, kernel)
-        
-        return sharpened
+        return denoised
     
     def _detect_datamatrix(self, image: np.ndarray) -> Optional[Tuple[Tuple[int, int, int, int], float, np.ndarray]]:
         """
@@ -412,50 +405,139 @@ class AutoDataMatrixScanner:
         
         Использует несколько методов для повышения надёжности:
         1. Прямое декодирование pyzbar
-        2. Декодирование с различными уровнями бинаризации
-        3. Декодирование с коррекцией перспективы
+        2. Декодирование pylibdmtx (специализированная библиотека)
+        3. Декодирование с различными уровнями бинаризации
+        4. Декодирование с коррекцией перспективы
         """
         if roi is None or roi.size == 0:
             return None
         
+        decoded_data = None
+        
         try:
             from pyzbar.pyzbar import decode as pyzbar_decode
             
-            # Метод 1: Прямое декодирование
+            # Метод 1: Прямое декодирование pyzbar
             if len(roi.shape) == 3:
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             else:
-                gray = roi
+                gray = roi.copy()
             
             decoded = pyzbar_decode(gray, symbols=[2])  # 2 = DataMatrix
             if decoded:
-                return decoded[0].data.decode('utf-8', errors='ignore')
+                decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                if decoded_data:
+                    return decoded_data
             
-            # Метод 2: Попытка с адаптивной бинаризацией
-            for block_size in [11, 21, 31]:
+            # Метод 2: Pylibdmtx (специализированная библиотека для DataMatrix)
+            try:
+                from pylibdmtx.pylibdmtx import decode as dmtx_decode
+                
+                # Попытка декодирования на оригинальном изображении
+                decoded = dmtx_decode(gray)
+                if decoded:
+                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                    if decoded_data:
+                        return decoded_data
+                
+                # Попытка с инверсией
+                inverted = cv2.bitwise_not(gray)
+                decoded = dmtx_decode(inverted)
+                if decoded:
+                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                    if decoded_data:
+                        return decoded_data
+                        
+            except ImportError:
+                pass  # pylibdmtx не установлен
+            except Exception:
+                pass  # Ошибка декодирования pylibdmtx
+            
+            # Метод 3: Попытка с адаптивной бинаризацией (pyzbar) - ограниченные параметры для скорости
+            for block_size in [21, 41]:
                 binary = cv2.adaptiveThreshold(
                     gray, 255,
                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY_INV,
+                    cv2.THRESH_BINARY,
                     block_size,
                     2
                 )
                 decoded = pyzbar_decode(binary, symbols=[2])
                 if decoded:
-                    return decoded[0].data.decode('utf-8', errors='ignore')
+                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                    if decoded_data:
+                        return decoded_data
+                
+                # Также пробуем pylibdmtx с бинаризацией
+                try:
+                    from pylibdmtx.pylibdmtx import decode as dmtx_decode
+                    decoded = dmtx_decode(binary)
+                    if decoded:
+                        decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                        if decoded_data:
+                            return decoded_data
+                except:
+                    pass
             
-            # Метод 3: Инверсия
+            # Метод 4: Инверсия + простая бинаризация
             inverted = cv2.bitwise_not(gray)
             decoded = pyzbar_decode(inverted, symbols=[2])
             if decoded:
-                return decoded[0].data.decode('utf-8', errors='ignore')
+                decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                if decoded_data:
+                    return decoded_data
             
+            # Метод 5: Улучшение контраста и резкости
+            enhanced = self._enhance_for_decoding(gray)
+            decoded = pyzbar_decode(enhanced, symbols=[2])
+            if decoded:
+                decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                if decoded_data:
+                    return decoded_data
+            
+            # Метод 6: Оптимальное масштабирование (только увеличение для мелких кодов)
+            if roi.shape[0] < 150 or roi.shape[1] < 150:
+                scaled = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+                decoded = pyzbar_decode(scaled, symbols=[2])
+                if decoded:
+                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                    if decoded_data:
+                        return decoded_data
+                        
+            # Метод 7: Pylibdmtx с инверсией (последняя попытка)
+            try:
+                from pylibdmtx.pylibdmtx import decode as dmtx_decode
+                inverted_enhanced = cv2.bitwise_not(enhanced)
+                decoded = dmtx_decode(inverted_enhanced)
+                if decoded:
+                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                    if decoded_data:
+                        return decoded_data
+            except:
+                pass
+                        
         except ImportError:
             pass
         except Exception as e:
             print(f"Ошибка декодирования: {e}")
         
         return None
+    
+    def _enhance_for_decoding(self, image: np.ndarray) -> np.ndarray:
+        """
+        Улучшение изображения специально для декодирования DataMatrix
+        Оптимизированная версия для скорости
+        """
+        # Быстрое усиление контраста через нормализацию
+        if image.dtype == np.uint8:
+            enhanced = cv2.convertScaleAbs(image, alpha=1.2, beta=0)
+        else:
+            enhanced = image.copy()
+        
+        # Быстрый фильтр для уменьшения шума (медианный вместо bilateral)
+        denoised = cv2.medianBlur(enhanced, 3)
+        
+        return denoised
     
     def _update_stats(self, start_time: float, found: bool = False, decoded: bool = False):
         """Обновление статистики"""
