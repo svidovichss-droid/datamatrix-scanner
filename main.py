@@ -18,9 +18,8 @@ from src.main_window import MainWindow
 def main():
     """Точка входа в приложение"""
     
-    # Настройка High-DPI
-    QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    # В PyQt6 High-DPI масштабирование включено по умолчанию
+    # Атрибуты AA_EnableHighDpiScaling и AA_UseHighDpiPixmaps удалены
     
     app = QApplication(sys.argv)
     app.setApplicationName("DataMatrix Scanner")
