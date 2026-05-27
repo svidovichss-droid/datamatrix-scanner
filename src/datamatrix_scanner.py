@@ -403,11 +403,14 @@ class AutoDataMatrixScanner:
         """
         Декодирование DataMatrix из ROI
         
-        Использует несколько методов для повышения надёжности:
+        Использует расширенный набор методов для максимального повышения надёжности:
         1. Прямое декодирование pyzbar
         2. Декодирование pylibdmtx (специализированная библиотека)
-        3. Декодирование с различными уровнями бинаризации
-        4. Декодирование с коррекцией перспективы
+        3. Множественные стратегии бинаризации
+        4. Коррекция перспективы и поворота
+        5. Улучшение контраста и резкости
+        6. Масштабирование для оптимального размера
+        7. Комбинированные методы предобработки
         """
         if roi is None or roi.size == 0:
             return None
@@ -417,61 +420,26 @@ class AutoDataMatrixScanner:
         try:
             from pyzbar.pyzbar import decode as pyzbar_decode
             
-            # Метод 1: Прямое декодирование pyzbar
+            # Подготовка grayscale изображения
             if len(roi.shape) == 3:
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             else:
                 gray = roi.copy()
             
-            decoded = pyzbar_decode(gray, symbols=[2])  # 2 = DataMatrix
-            if decoded:
-                decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                if decoded_data:
-                    return decoded_data
+            # Список всех стратегий для попытки декодирования
+            processing_strategies = self._generate_processing_strategies(gray)
             
-            # Метод 2: Pylibdmtx (специализированная библиотека для DataMatrix)
-            try:
-                from pylibdmtx.pylibdmtx import decode as dmtx_decode
-                
-                # Попытка декодирования на оригинальном изображении
-                decoded = dmtx_decode(gray)
+            for i, processed_image in enumerate(processing_strategies):
+                decoded = pyzbar_decode(processed_image, symbols=[2])  # 2 = DataMatrix
                 if decoded:
                     decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
                     if decoded_data:
                         return decoded_data
                 
-                # Попытка с инверсией
-                inverted = cv2.bitwise_not(gray)
-                decoded = dmtx_decode(inverted)
-                if decoded:
-                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                    if decoded_data:
-                        return decoded_data
-                        
-            except ImportError:
-                pass  # pylibdmtx не установлен
-            except Exception:
-                pass  # Ошибка декодирования pylibdmtx
-            
-            # Метод 3: Попытка с адаптивной бинаризацией (pyzbar) - ограниченные параметры для скорости
-            for block_size in [21, 41]:
-                binary = cv2.adaptiveThreshold(
-                    gray, 255,
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY,
-                    block_size,
-                    2
-                )
-                decoded = pyzbar_decode(binary, symbols=[2])
-                if decoded:
-                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                    if decoded_data:
-                        return decoded_data
-                
-                # Также пробуем pylibdmtx с бинаризацией
+                # Также пробуем pylibdmtx для каждой стратегии
                 try:
                     from pylibdmtx.pylibdmtx import decode as dmtx_decode
-                    decoded = dmtx_decode(binary)
+                    decoded = dmtx_decode(processed_image)
                     if decoded:
                         decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
                         if decoded_data:
@@ -479,42 +447,24 @@ class AutoDataMatrixScanner:
                 except:
                     pass
             
-            # Метод 4: Инверсия + простая бинаризация
-            inverted = cv2.bitwise_not(gray)
-            decoded = pyzbar_decode(inverted, symbols=[2])
-            if decoded:
-                decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                if decoded_data:
-                    return decoded_data
-            
-            # Метод 5: Улучшение контраста и резкости
-            enhanced = self._enhance_for_decoding(gray)
-            decoded = pyzbar_decode(enhanced, symbols=[2])
-            if decoded:
-                decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                if decoded_data:
-                    return decoded_data
-            
-            # Метод 6: Оптимальное масштабирование (только увеличение для мелких кодов)
-            if roi.shape[0] < 150 or roi.shape[1] < 150:
-                scaled = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
-                decoded = pyzbar_decode(scaled, symbols=[2])
+            # Финальная попытка с коррекцией перспективы
+            perspective_corrected = self._correct_perspective(gray)
+            if perspective_corrected is not None:
+                decoded = pyzbar_decode(perspective_corrected, symbols=[2])
                 if decoded:
                     decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
                     if decoded_data:
                         return decoded_data
-                        
-            # Метод 7: Pylibdmtx с инверсией (последняя попытка)
-            try:
-                from pylibdmtx.pylibdmtx import decode as dmtx_decode
-                inverted_enhanced = cv2.bitwise_not(enhanced)
-                decoded = dmtx_decode(inverted_enhanced)
-                if decoded:
-                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                    if decoded_data:
-                        return decoded_data
-            except:
-                pass
+                
+                try:
+                    from pylibdmtx.pylibdmtx import decode as dmtx_decode
+                    decoded = dmtx_decode(perspective_corrected)
+                    if decoded:
+                        decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
+                        if decoded_data:
+                            return decoded_data
+                except:
+                    pass
                         
         except ImportError:
             pass
@@ -523,21 +473,235 @@ class AutoDataMatrixScanner:
         
         return None
     
-    def _enhance_for_decoding(self, image: np.ndarray) -> np.ndarray:
+    def _generate_processing_strategies(self, gray: np.ndarray) -> List[np.ndarray]:
         """
-        Улучшение изображения специально для декодирования DataMatrix
-        Оптимизированная версия для скорости
+        Генерация множества стратегий предобработки изображения
+        
+        Возвращает список обработанных изображений для попытки декодирования
         """
-        # Быстрое усиление контраста через нормализацию
-        if image.dtype == np.uint8:
-            enhanced = cv2.convertScaleAbs(image, alpha=1.2, beta=0)
-        else:
-            enhanced = image.copy()
+        strategies = []
         
-        # Быстрый фильтр для уменьшения шума (медианный вместо bilateral)
-        denoised = cv2.medianBlur(enhanced, 3)
+        # Стратегия 1: Оригинал
+        strategies.append(gray.copy())
         
-        return denoised
+        # Стратегия 2: Инверсия
+        strategies.append(cv2.bitwise_not(gray))
+        
+        # Стратегия 3: Усиление контраста (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        strategies.append(clahe.apply(gray))
+        
+        # Стратегия 4: CLAHE + инверсия
+        clahe_img = clahe.apply(gray)
+        strategies.append(cv2.bitwise_not(clahe_img))
+        
+        # Стратегия 5-8: Адаптивная бинаризация с разными параметрами
+        for block_size in [11, 21, 31, 51]:
+            binary = cv2.adaptiveThreshold(
+                gray, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                block_size,
+                5
+            )
+            strategies.append(binary)
+            
+            # Инвертированная адаптивная бинаризация
+            strategies.append(cv2.bitwise_not(binary))
+        
+        # Стратегия 9-12: Адаптивная бинаризация с THRESH_MEAN_C
+        for block_size in [15, 25, 35, 45]:
+            binary_mean = cv2.adaptiveThreshold(
+                gray, 255,
+                cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY,
+                block_size,
+                7
+            )
+            strategies.append(binary_mean)
+        
+        # Стратегия 13-16: Бинаризация Оцу с различными предобработками
+        for blur_kernel in [3, 5, 7, 9]:
+            blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+            _, binary_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            strategies.append(binary_otsu)
+            
+            # Инвертированная Оцу
+            _, binary_otsu_inv = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            strategies.append(binary_otsu_inv)
+        
+        # Стратегия 17-20: Улучшение резкости
+        for alpha in [1.3, 1.5, 1.7, 2.0]:
+            enhanced = self._sharpen_image(gray, alpha)
+            strategies.append(enhanced)
+            strategies.append(cv2.bitwise_not(enhanced))
+        
+        # Стратегия 21-24: Масштабирование для разных размеров
+        for scale in [1.5, 2.0, 2.5, 3.0]:
+            if gray.shape[0] < 200 or gray.shape[1] < 200:
+                scaled = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                strategies.append(scaled)
+                
+                # CLAHE на масштабированном
+                clahe_scaled = clahe.apply(scaled)
+                strategies.append(clahe_scaled)
+        
+        # Стратегия 25-28: Комбинация CLAHE + sharpening
+        for alpha in [1.3, 1.5, 1.7, 2.0]:
+            clahe_img = clahe.apply(gray)
+            sharpened = self._sharpen_image(clahe_img, alpha)
+            strategies.append(sharpened)
+        
+        # Стратегия 29-32: Denoising + бинаризация
+        for strength in [5, 10, 15, 20]:
+            denoised = cv2.fastNlMeansDenoising(gray, None, h=strength)
+            _, binary_denoised = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            strategies.append(binary_denoised)
+        
+        # Стратегия 33-36: Морфологические операции
+        kernel_sizes = [2, 3, 4, 5]
+        for k_size in kernel_sizes:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+            
+            # Закрытие для соединения разрывов
+            closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+            strategies.append(closed)
+            
+            # Открытие для удаления шума
+            opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+            strategies.append(opened)
+        
+        # Стратегия 37-40: Гамма-коррекция
+        for gamma in [0.5, 0.7, 1.3, 1.5]:
+            gamma_corrected = self._gamma_correction(gray, gamma)
+            strategies.append(gamma_corrected)
+            
+            # CLAHE после гамма-коррекции
+            clahe_gamma = clahe.apply(gamma_corrected)
+            strategies.append(clahe_gamma)
+        
+        # Стратегия 41-44: Бинаризация Sauvola (через skimage если доступна)
+        try:
+            from skimage.filters import threshold_sauvola
+            
+            window_sizes = [25, 35, 45, 55]
+            for w_size in window_sizes:
+                if gray.shape[0] > w_size and gray.shape[1] > w_size:
+                    threshold = threshold_sauvola(gray, window_size=w_size)
+                    binary_sauvola = (gray > threshold).astype(np.uint8) * 255
+                    strategies.append(binary_sauvola)
+        except ImportError:
+            pass  # skimage не установлен
+        
+        # Стратегия 45-48: Комбинации нескольких методов
+        for i in range(4):
+            # CLAHE -> Sharpen -> Adaptive Threshold
+            step1 = clahe.apply(gray)
+            step2 = self._sharpen_image(step1, 1.5)
+            step3 = cv2.adaptiveThreshold(
+                step2, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                21 + i * 10,
+                5
+            )
+            strategies.append(step3)
+        
+        return strategies
+    
+    def _sharpen_image(self, image: np.ndarray, alpha: float = 1.5) -> np.ndarray:
+        """
+        Увеличение резкости изображения с помощью unsharp masking
+        """
+        blurred = cv2.GaussianBlur(image, (5, 5), 0)
+        sharpened = cv2.addWeighted(image, alpha, blurred, 1 - alpha, 0)
+        return sharpened
+    
+    def _gamma_correction(self, image: np.ndarray, gamma: float = 1.0) -> np.ndarray:
+        """
+        Гамма-коррекция изображения
+        """
+        invGamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** (1.0 / invGamma)) * 255
+                         for i in np.arange(0, 256)]).astype("uint8")
+        return cv2.LUT(image, table)
+    
+    def _correct_perspective(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Коррекция перспективы для DataMatrix кода
+        
+        Пытается обнаружить углы кода и выпрямить изображение
+        """
+        # Бинаризация для поиска контуров
+        _, binary = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Поиск контуров
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        best_contour = None
+        best_area = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > best_area and area > 1000:  # Минимальная площадь
+                # Аппроксимация полигоном
+                peri = cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+                
+                # Ищем четырёхугольники
+                if len(approx) == 4:
+                    best_contour = approx
+                    best_area = area
+        
+        if best_contour is None:
+            return None
+        
+        # Получаем точки контура
+        points = best_contour.reshape(4, 2)
+        
+        # Сортируем точки: top-left, top-right, bottom-right, bottom-left
+        rect = self._order_points(points)
+        
+        # Вычисляем размеры нового изображения
+        width_a = np.sqrt(((rect[2][0] - rect[1][0]) ** 2) + ((rect[2][1] - rect[1][1]) ** 2))
+        width_b = np.sqrt(((rect[3][0] - rect[0][0]) ** 2) + ((rect[3][1] - rect[0][1]) ** 2))
+        max_width = int(max(width_a, width_b))
+        
+        height_a = np.sqrt(((rect[1][0] - rect[0][0]) ** 2) + ((rect[1][1] - rect[0][1]) ** 2))
+        height_b = np.sqrt(((rect[2][0] - rect[3][0]) ** 2) + ((rect[2][1] - rect[3][1]) ** 2))
+        max_height = int(max(height_a, height_b))
+        
+        # Целевые точки
+        dst = np.array([
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1]
+        ], dtype="float32")
+        
+        # Матрица перспективы
+        M = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
+        warped = cv2.warpPerspective(image, M, (max_width, max_height))
+        
+        return warped
+    
+    def _order_points(self, pts: np.ndarray) -> np.ndarray:
+        """
+        Сортировка точек в порядке: top-left, top-right, bottom-right, bottom-left
+        """
+        rect = np.zeros((4, 2), dtype="float32")
+        
+        # Сортировка по сумме координат (top-left имеет наименьшую сумму)
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        
+        # Сортировка по разности координат (top-right имеет наименьшую разность)
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        
+        return rect
     
     def _update_stats(self, start_time: float, found: bool = False, decoded: bool = False):
         """Обновление статистики"""
