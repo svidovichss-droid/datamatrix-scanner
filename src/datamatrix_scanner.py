@@ -2,6 +2,7 @@
 Модуль автоматического поиска, захвата и распознавания DataMatrix кодов
 
 Авторы: А. Свидович / А. Петляков для PROGRESS
+Оптимизированная версия с ускоренной обработкой и декодированием
 """
 
 import cv2
@@ -11,6 +12,9 @@ from dataclasses import dataclass
 from enum import Enum
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+import hashlib
 
 
 class DetectionStatus(Enum):
@@ -43,9 +47,19 @@ class AutoDataMatrixScanner:
     - Автоматический захват лучшего кадра
     - Распознавание и декодирование
     - Верификацию результата
+    
+    Оптимизации производительности:
+    - Кэширование результатов обработки
+    - Пул потоков для параллельного декодирования
+    - Умный выбор стратегий обработки
+    - Раннее завершение при успешном декодировании
     """
     
-    def __init__(self):
+    # Классовые переменные для общих ресурсов
+    _decoder_pool = None
+    _clahe_cache = None
+    
+    def __init__(self, max_workers: int = 4):
         # Параметры детекции
         self.min_code_size = 50  # Минимальный размер кода в пикселях
         self.max_code_size = 800  # Максимальный размер
@@ -62,12 +76,25 @@ class AutoDataMatrixScanner:
         self._last_result: Optional[DataMatrixResult] = None
         self._lock = threading.Lock()
         
+        # Оптимизация: кэш последних обработанных кадров
+        self._cache_max_size = 10
+        self._frame_cache = deque(maxlen=self._cache_max_size)
+        self._cache_lock = threading.Lock()
+        
+        # Оптимизация: пул потоков для параллельного декодирования
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        
+        # Оптимизация: предсоздание CLAHE объекта
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        
         # Статистика
         self.stats = {
             'frames_processed': 0,
             'codes_found': 0,
             'codes_decoded': 0,
-            'avg_processing_time': 0.0
+            'avg_processing_time': 0.0,
+            'cache_hits': 0,
+            'parallel_decodes': 0
         }
     
     def process_frame(self, frame: np.ndarray) -> DataMatrixResult:
@@ -89,15 +116,24 @@ class AutoDataMatrixScanner:
                 result.error_message = "Пустой кадр"
                 return result
             
-            # Предобработка
+            # Оптимизация: проверка кэша по хэшу кадра
+            frame_hash = self._fast_frame_hash(frame)
+            cached_result = self._get_from_cache(frame_hash)
+            if cached_result is not None:
+                with self._lock:
+                    self.stats['cache_hits'] += 1
+                return cached_result
+            
+            # Предобработка (оптимизированная)
             processed = self._preprocess_frame(frame)
             
-            # Поиск DataMatrix
+            # Поиск DataMatrix (оптимизированный поиск)
             detection = self._detect_datamatrix(processed)
             
             if not detection:
                 result.status = DetectionStatus.NOT_FOUND
                 self._update_stats(start_time, found=False)
+                self._add_to_cache(frame_hash, result)
                 return result
             
             bbox, confidence, roi = detection
@@ -106,14 +142,15 @@ class AutoDataMatrixScanner:
             if not self._validate_size(bbox):
                 result.status = DetectionStatus.NOT_FOUND
                 self._update_stats(start_time, found=False)
+                self._add_to_cache(frame_hash, result)
                 return result
             
             result.bbox = bbox
             result.confidence = confidence
             result.roi = roi.copy() if roi is not None else None
             
-            # Попытка декодирования
-            decoded_data = self._decode_roi(roi)
+            # Попытка декодирования (оптимизированная)
+            decoded_data = self._decode_roi_optimized(roi)
             
             if decoded_data:
                 result.status = DetectionStatus.DECODED
@@ -130,6 +167,9 @@ class AutoDataMatrixScanner:
         result.processing_time_ms = (time.time() - start_time) * 1000
         self._last_result = result
         
+        # Кэширование результата
+        self._add_to_cache(frame_hash, result)
+        
         with self._lock:
             self.stats['frames_processed'] += 1
             prev_avg = self.stats['avg_processing_time']
@@ -137,6 +177,30 @@ class AutoDataMatrixScanner:
             self.stats['avg_processing_time'] = prev_avg + (result.processing_time_ms - prev_avg) / n
         
         return result
+    
+    def _fast_frame_hash(self, frame: np.ndarray) -> int:
+        """Быстрое вычисление хэша кадра для кэширования"""
+        # Используем уменьшенную версию кадра для скорости
+        if frame.shape[0] > 64 or frame.shape[1] > 64:
+            small = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+        
+        # Быстрый хэш на основе суммы пикселей и формы
+        return hash((small.shape, small.sum() % 1000000, small.mean() % 1000))
+    
+    def _get_from_cache(self, frame_hash: int) -> Optional[DataMatrixResult]:
+        """Получение результата из кэша"""
+        with self._cache_lock:
+            for cached_hash, cached_result in self._frame_cache:
+                if cached_hash == frame_hash:
+                    return cached_result
+        return None
+    
+    def _add_to_cache(self, frame_hash: int, result: DataMatrixResult):
+        """Добавление результата в кэш"""
+        with self._cache_lock:
+            self._frame_cache.append((frame_hash, result))
     
     def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -146,18 +210,21 @@ class AutoDataMatrixScanner:
         - Конвертацию в градации серого
         - Быстрое усиление контраста
         - Минимальное уменьшение шума
+        
+        Оптимизации:
+        - Использование предсозданного CLAHE объекта
+        - SIMD-оптимизированные операции OpenCV
         """
-        # Конвертация в grayscale
+        # Конвертация в grayscale (используем оптимизированный метод)
         if len(frame.shape) == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:
             gray = frame.copy()
         
-        # Быстрое усиление контраста через CLAHE с меньшими параметрами
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        # Быстрое усиление контраста через предсозданный CLAHE объект
+        enhanced = self._clahe.apply(gray)
         
-        # Очень быстрое уменьшение шума (медианный фильтр)
+        # Очень быстрое уменьшение шума (медианный фильтр с малым ядром)
         denoised = cv2.medianBlur(enhanced, 3)
         
         return denoised
@@ -401,7 +468,7 @@ class AutoDataMatrixScanner:
     
     def _decode_roi(self, roi: np.ndarray) -> Optional[str]:
         """
-        Декодирование DataMatrix из ROI
+        Декодирование DataMatrix из ROI (устаревший метод для совместимости)
         
         Использует расширенный набор методов для максимального повышения надёжности:
         1. Прямое декодирование pyzbar
@@ -411,6 +478,19 @@ class AutoDataMatrixScanner:
         5. Улучшение контраста и резкости
         6. Масштабирование для оптимального размера
         7. Комбинированные методы предобработки
+        """
+        return self._decode_roi_optimized(roi)
+    
+    def _decode_roi_optimized(self, roi: np.ndarray) -> Optional[str]:
+        """
+        Оптимизированное декодирование DataMatrix из ROI
+        
+        Ключевые оптимизации:
+        1. Приоритет быстрых стратегий
+        2. Параллельная обработка стратегий в пуле потоков
+        3. Раннее завершение при успехе
+        4. Умный выбор стратегий на основе характеристик ROI
+        5. Кэширование результатов декодирования
         """
         if roi is None or roi.size == 0:
             return None
@@ -426,45 +506,44 @@ class AutoDataMatrixScanner:
             else:
                 gray = roi.copy()
             
-            # Список всех стратегий для попытки декодирования
-            processing_strategies = self._generate_processing_strategies(gray)
+            # Быстрая попытка №1: прямое декодирование оригинала
+            decoded = pyzbar_decode(gray, symbols=[2])
+            if decoded:
+                return decoded[0].data.decode('utf-8', errors='ignore')
             
-            for i, processed_image in enumerate(processing_strategies):
-                decoded = pyzbar_decode(processed_image, symbols=[2])  # 2 = DataMatrix
-                if decoded:
-                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                    if decoded_data:
-                        return decoded_data
-                
-                # Также пробуем pylibdmtx для каждой стратегии
-                try:
-                    from pylibdmtx.pylibdmtx import decode as dmtx_decode
-                    decoded = dmtx_decode(processed_image)
-                    if decoded:
-                        decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                        if decoded_data:
-                            return decoded_data
-                except:
-                    pass
+            # Быстрая попытка №2: инверсия
+            inverted = cv2.bitwise_not(gray)
+            decoded = pyzbar_decode(inverted, symbols=[2])
+            if decoded:
+                return decoded[0].data.decode('utf-8', errors='ignore')
             
-            # Финальная попытка с коррекцией перспективы
+            # Быстрая попытка №3: CLAHE
+            clahe_img = self._clahe.apply(gray)
+            decoded = pyzbar_decode(clahe_img, symbols=[2])
+            if decoded:
+                return decoded[0].data.decode('utf-8', errors='ignore')
+            
+            # Анализ ROI для выбора оптимальных стратегий
+            strategies = self._generate_smart_strategies(gray)
+            
+            # Параллельное декодирование стратегий
+            decoded_data = self._parallel_decode(strategies)
+            
+            if decoded_data:
+                return decoded_data
+            
+            # Финальная попытка с коррекцией перспективы (только если простые методы не сработали)
             perspective_corrected = self._correct_perspective(gray)
             if perspective_corrected is not None:
                 decoded = pyzbar_decode(perspective_corrected, symbols=[2])
                 if decoded:
-                    decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                    if decoded_data:
-                        return decoded_data
+                    return decoded[0].data.decode('utf-8', errors='ignore')
                 
-                try:
-                    from pylibdmtx.pylibdmtx import decode as dmtx_decode
-                    decoded = dmtx_decode(perspective_corrected)
-                    if decoded:
-                        decoded_data = decoded[0].data.decode('utf-8', errors='ignore')
-                        if decoded_data:
-                            return decoded_data
-                except:
-                    pass
+                # Параллельное декодирование для перспективно исправленного изображения
+                perspective_strategies = self._generate_smart_strategies(perspective_corrected)
+                decoded_data = self._parallel_decode(perspective_strategies)
+                if decoded_data:
+                    return decoded_data
                         
         except ImportError:
             pass
@@ -472,6 +551,146 @@ class AutoDataMatrixScanner:
             print(f"Ошибка декодирования: {e}")
         
         return None
+    
+    def _parallel_decode(self, strategies: List[Tuple[str, np.ndarray]]) -> Optional[str]:
+        """
+        Параллельное декодирование множества стратегий обработки
+        
+        Args:
+            strategies: Список кортежей (название, изображение)
+            
+        Returns:
+            Декодированные данные или None
+        """
+        if not strategies:
+            return None
+        
+        # Для небольшого количества стратегий используем последовательное декодирование
+        if len(strategies) <= 4:
+            for name, img in strategies:
+                result = self._try_decode_single(img)
+                if result:
+                    return result
+            return None
+        
+        # Для большого количества - параллельное выполнение
+        # Не используем with, чтобы не закрывать executor
+        futures = {}
+        try:
+            for name, img in strategies[:8]:  # Ограничиваем количество для скорости
+                future = self._executor.submit(self._try_decode_single, img)
+                futures[future] = name
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=0.5)  # Таймаут на каждую стратегию
+                    if result:
+                        with self._lock:
+                            self.stats['parallel_decodes'] += 1
+                        return result
+                except Exception:
+                    continue
+        except RuntimeError:
+            # Executor закрыт, используем последовательное декодирование
+            for name, img in strategies:
+                result = self._try_decode_single(img)
+                if result:
+                    return result
+        
+        return None
+    
+    def _try_decode_single(self, image: np.ndarray) -> Optional[str]:
+        """
+        Попытка декодирования одного изображения через pyzbar и pylibdmtx
+        
+        Args:
+            image: Изображение для декодирования
+            
+        Returns:
+            Декодированные данные или None
+        """
+        try:
+            from pyzbar.pyzbar import decode as pyzbar_decode
+            
+            decoded = pyzbar_decode(image, symbols=[2])
+            if decoded:
+                return decoded[0].data.decode('utf-8', errors='ignore')
+            
+            # Пробуем pylibdmtx как запасной вариант
+            try:
+                from pylibdmtx.pylibdmtx import decode as dmtx_decode
+                decoded = dmtx_decode(image)
+                if decoded:
+                    return decoded[0].data.decode('utf-8', errors='ignore')
+            except:
+                pass
+                
+        except:
+            pass
+        
+        return None
+    
+    def _generate_smart_strategies(self, gray: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+        """
+        Умная генерация стратегий предобработки на основе характеристик изображения
+        
+        Возвращает список кортежей (название, изображение) приоритезированный по вероятности успеха
+        """
+        strategies = []
+        
+        # Вычисляем метрики изображения для выбора стратегий
+        mean_val = np.mean(gray)
+        std_val = np.std(gray)
+        
+        # Стратегия 1: Адаптивная бинаризация (эффективна при неравномерном освещении)
+        if std_val < 50:  # Низкий контраст
+            for block_size in [21, 31, 51]:
+                binary = cv2.adaptiveThreshold(
+                    gray, 255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    block_size,
+                    5
+                )
+                strategies.append((f"adaptive_gauss_{block_size}", binary))
+        
+        # Стратегия 2: Оцу бинаризация (эффективна при хорошем контрасте)
+        if std_val >= 50:
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, binary_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            strategies.append(("otsu", binary_otsu))
+            strategies.append(("otsu_inv", cv2.bitwise_not(binary_otsu)))
+        
+        # Стратегия 3: Масштабирование для маленьких кодов
+        if gray.shape[0] < 100 or gray.shape[1] < 100:
+            scaled = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            strategies.append(("scaled_2x", scaled))
+            scaled_clahe = self._clahe.apply(scaled)
+            strategies.append(("scaled_clahe", scaled_clahe))
+        
+        # Стратегия 4: Усиление резкости для размытых изображений
+        if std_val > 30:
+            sharpened = self._sharpen_image(gray, 1.5)
+            strategies.append(("sharpened", sharpened))
+            strategies.append(("sharpened_inv", cv2.bitwise_not(sharpened)))
+        
+        # Стратегия 5: CLAHE + адаптивная бинаризация (комбинированная)
+        clahe_img = self._clahe.apply(gray)
+        binary_combined = cv2.adaptiveThreshold(
+            clahe_img, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            21,
+            5
+        )
+        strategies.append(("clahe_adaptive", binary_combined))
+        
+        # Стратегия 6: Инвертированные версии для тёмных кодов на светлом фоне
+        if mean_val > 128:  # Светлое изображение
+            strategies.append(("inverted", cv2.bitwise_not(gray)))
+            strategies.append(("clahe_inverted", cv2.bitwise_not(clahe_img)))
+        
+        return strategies
     
     def _generate_processing_strategies(self, gray: np.ndarray) -> List[np.ndarray]:
         """
@@ -727,8 +946,15 @@ class AutoDataMatrixScanner:
                 'frames_processed': 0,
                 'codes_found': 0,
                 'codes_decoded': 0,
-                'avg_processing_time': 0.0
+                'avg_processing_time': 0.0,
+                'cache_hits': 0,
+                'parallel_decodes': 0
             }
+    
+    def shutdown(self):
+        """Корректное завершение работы и освобождение ресурсов"""
+        if hasattr(self, '_executor') and self._executor is not None:
+            self._executor.shutdown(wait=False)
 
 
 class ContinuousScanner:
